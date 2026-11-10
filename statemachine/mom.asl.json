@@ -1,0 +1,107 @@
+{
+  "Comment": "Meeting recording to MOM email",
+  "TimeoutSeconds": 1800,
+  "StartAt": "StartTranscription",
+  "States": {
+    "StartTranscription": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${StartJobFunctionArn}",
+        "Payload.$": "$"
+      },
+      "OutputPath": "$.Payload",
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Next": "WaitForTranscript"
+    },
+    "WaitForTranscript": {
+      "Type": "Wait",
+      "Seconds": 20,
+      "Next": "CheckTranscription"
+    },
+    "CheckTranscription": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${CheckJobFunctionArn}",
+        "Payload.$": "$"
+      },
+      "OutputPath": "$.Payload",
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Next": "IsTranscriptReady"
+    },
+    "IsTranscriptReady": {
+      "Type": "Choice",
+      "Choices": [
+        { "Variable": "$.status", "StringEquals": "COMPLETED", "Next": "ExtractMom" },
+        { "Variable": "$.status", "StringEquals": "FAILED", "Next": "TranscriptionFailed" }
+      ],
+      "Default": "WaitForTranscript"
+    },
+    "TranscriptionFailed": {
+      "Type": "Fail",
+      "Error": "TranscriptionFailed",
+      "CausePath": "$.failureReason"
+    },
+    "ExtractMom": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${ExtractMomFunctionArn}",
+        "Payload.$": "$"
+      },
+      "OutputPath": "$.Payload",
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 2,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        { "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "NotifyFailure" }
+      ],
+      "Next": "SendMom"
+    },
+    "SendMom": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${TopicArn}",
+        "Subject.$": "$.emailSubject",
+        "Message.$": "$.emailBody"
+      },
+      "End": true
+    },
+    "NotifyFailure": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${TopicArn}",
+        "Subject": "MOM generation failed",
+        "Message.$": "States.Format('MOM generation failed for {}. Open the Step Functions execution for details.', $.audioKey)"
+      },
+      "Next": "MomFailed"
+    },
+    "MomFailed": {
+      "Type": "Fail",
+      "Error": "MomExtractionFailed",
+      "Cause": "Bedrock extraction failed or returned invalid JSON"
+    }
+  }
+}

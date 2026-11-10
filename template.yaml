@@ -1,0 +1,178 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: Meeting recording to MOM email
+
+Parameters:
+  NotificationEmail:
+    Type: String
+    Description: Address that receives the MOM
+    AllowedPattern: '[^@\s]+@[^@\s]+\.[^@\s]+'
+    ConstraintDescription: Must be an email address
+  BedrockModelId:
+    Type: String
+    Default: amazon.nova-lite-v1:0
+  MaxSpeakers:
+    Type: Number
+    Default: 2
+    MinValue: 2
+    MaxValue: 30
+    Description: Number of speakers Transcribe should separate (2 for the test call)
+  TranscribeLanguages:
+    Type: CommaDelimitedList
+    Default: "hi-IN,en-IN"
+    Description: One code (e.g. en-US) or several for mixed-language calls (e.g. hi-IN,en-IN)
+  PreparedBy:
+    Type: String
+    Default: ""
+    Description: Name printed in the "Prepared by" field and the email signature (blank = placeholder)
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 30
+    MemorySize: 256
+    Environment:
+      Variables:
+        BUCKET: !Ref AudioBucket
+
+Resources:
+  AudioBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+
+  StartJobLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: !Ref LogRetentionDays
+
+  CheckJobLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: !Ref LogRetentionDays
+
+  ExtractMomLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: !Ref LogRetentionDays
+
+  MomTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref NotificationEmail
+
+  StartJobFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/start_job/
+      Handler: app.handler
+      LoggingConfig:
+        LogGroup: !Ref StartJobLogGroup
+      Environment:
+        Variables:
+          MAX_SPEAKERS: !Ref MaxSpeakers
+          TRANSCRIBE_LANGUAGES: !Join [",", !Ref TranscribeLanguages]
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: transcribe:StartTranscriptionJob
+              Resource: !Sub "arn:${AWS::Partition}:transcribe:${AWS::Region}:${AWS::AccountId}:transcription-job/mom-*"
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub "${AudioBucket.Arn}/uploads/*"
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub "${AudioBucket.Arn}/transcripts/*"
+
+  CheckJobFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/check_job/
+      Handler: app.handler
+      LoggingConfig:
+        LogGroup: !Ref CheckJobLogGroup
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: transcribe:GetTranscriptionJob
+              Resource: !Sub "arn:${AWS::Partition}:transcribe:${AWS::Region}:${AWS::AccountId}:transcription-job/mom-*"
+
+  ExtractMomFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/extract_mom/
+      Handler: app.handler
+      LoggingConfig:
+        LogGroup: !Ref ExtractMomLogGroup
+      Timeout: 120
+      MemorySize: 512
+      Environment:
+        Variables:
+          MODEL_ID: !Ref BedrockModelId
+          PREPARED_BY: !Ref PreparedBy
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub "${AudioBucket.Arn}/transcripts/*"
+            - Effect: Allow
+              Action:
+                - s3:PutObject
+                - s3:GetObject
+              Resource: !Sub "${AudioBucket.Arn}/mom/*"
+            - Effect: Allow
+              Action: bedrock:InvokeModel
+              Resource: !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/${BedrockModelId}"
+
+  MomStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      DefinitionUri: statemachine/mom.asl.json
+      DefinitionSubstitutions:
+        StartJobFunctionArn: !GetAtt StartJobFunction.Arn
+        CheckJobFunctionArn: !GetAtt CheckJobFunction.Arn
+        ExtractMomFunctionArn: !GetAtt ExtractMomFunction.Arn
+        TopicArn: !Ref MomTopic
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref StartJobFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref CheckJobFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref ExtractMomFunction
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt MomTopic.TopicName
+      Events:
+        AudioUploaded:
+          Type: EventBridgeRule
+          Properties:
+            Pattern:
+              source:
+                - aws.s3
+              detail-type:
+                - Object Created
+              detail:
+                bucket:
+                  name:
+                    - !Ref AudioBucket
+                object:
+                  key:
+                    - prefix: uploads/
+
+Outputs:
+  BucketName:
+    Value: !Ref AudioBucket
+  StateMachineArn:
+    Value: !Ref MomStateMachine
